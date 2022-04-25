@@ -3,6 +3,7 @@ from timeit import timeit
 from subprocess import Popen, PIPE
 import time
 import re
+import heapq
 
 stockfish_path = r'/storage/emulated/0/pythonscripts/stockfish_14.1_android_armv7/stockfish_14.1_android_armv7/stockfish.android.armv7'
 
@@ -569,10 +570,14 @@ class Board:
         self.enpassant_states = []
         self.castle_states = []
         self.unmake_stack = []
-        # perft function 'global variable'
         self.nodes = 0
-        # negamax function 'global variables'
         self.ply = 0
+        self.best_move = 0
+        self.killer_moves = [[0 for ply in range(64)] for idx in range(2)]
+        self.history_moves = [[0 for ply in range(64)] for piece in range(6)]
+        self.pv_length = [0 for i in range(64)]
+        self.pv_table = [[0 for ply in range(64)] for ply in range(64)]
+        self.prev_fen = ''
 
     def print_board(self):
         for rank in range(8):
@@ -746,8 +751,7 @@ class Board:
         opp_rookqueen_attacks = get_rook_attacks(king_sq, both_occupancy)
         rookqueen_checker = opp_rookqueen_attacks & opp_rookqueen_bb
         rookqueen_checkmask = RECT_LOOKUP[get_lsb_index(rookqueen_checker)][king_sq] if rookqueen_checker else 0
-        check_count = (pawn_checkmask > 0) + (knight_checkmask > 0) + (bishopqueen_checkmask > 0) + (
-                rookqueen_checkmask > 0)
+        check_count = count_bits(pawn_checkmask | knight_checkmask | bishopqueen_checker | rookqueen_checker)
 
         # no check
         if check_count == 0:
@@ -759,19 +763,18 @@ class Board:
 
         # double check
         else:
-            self.occupancy[BOTH] ^= (1 << king_sq)
+            self.occupancy[BOTH] ^= king_bb
             # captures
             attacks = get_king_attacks(king_sq)
             for target_sq in get_set_bits_idx(attacks & opp_occupancy):
                 if not self.is_square_attacked(target_sq):
-                    moves.append((king_sq, target_sq, K, 0, 1, 0, 0, 0))
+                    moves.append((king_sq, target_sq, K, 0, self.get_captured_piece(target_sq), 0, 0, 0))
             # quiet moves
             for target_sq in get_set_bits_idx(attacks & flip_bit(both_occupancy)):
                 if not self.is_square_attacked(target_sq):
-                    moves.append((king_sq, target_sq, K, 0, 0, 0, 0, 0))
-            self.occupancy[BOTH] ^= (1 << king_sq)
+                    moves.append((king_sq, target_sq, K, 0, -1, 0, 0, 0))
+            self.occupancy[BOTH] ^= king_bb
             return moves
-
         # GENERATE PINMASK
         orthogonal_pinmask = 0
         orthogonal_blockers = opp_rookqueen_attacks & occupancy
@@ -810,20 +813,20 @@ class Board:
             single_push_target_bb = single_push_pawn_bb >> 8 & flip_bit(both_occupancy) & checkmask
             # single pawn pushes without promotion
             for target_sq in get_set_bits_idx(single_push_target_bb & not_8_rank):
-                moves.append((target_sq + 8, target_sq, P, 0, 0, 0, 0, 0))
+                moves.append((target_sq + 8, target_sq, P, 0, -1, 0, 0, 0))
             # single pawn pushes with promotion
             for target_sq in get_set_bits_idx(single_push_target_bb & rank_8):
-                moves.append((target_sq + 8, target_sq, P, Q, 0, 0, 0, 0))
-                moves.append((target_sq + 8, target_sq, P, R, 0, 0, 0, 0))
-                moves.append((target_sq + 8, target_sq, P, B, 0, 0, 0, 0))
-                moves.append((target_sq + 8, target_sq, P, N, 0, 0, 0, 0))
+                moves.append((target_sq + 8, target_sq, P, Q, -1, 0, 0, 0))
+                moves.append((target_sq + 8, target_sq, P, R, -1, 0, 0, 0))
+                moves.append((target_sq + 8, target_sq, P, B, -1, 0, 0, 0))
+                moves.append((target_sq + 8, target_sq, P, N, -1, 0, 0, 0))
 
             double_push_pawn_bb = single_push_pawn_bb & rank_2
             double_push_target_bb = (double_push_pawn_bb >> 8 & flip_bit(both_occupancy)) >> 8 & flip_bit(
                 both_occupancy) & checkmask
             # double pawn pushes
             for target_sq in get_set_bits_idx(double_push_target_bb):
-                moves.append((target_sq + 16, target_sq, P, 0, 0, 1, 0, 0))
+                moves.append((target_sq + 16, target_sq, P, 0, -1, 1, 0, 0))
             right_capture_pawn_bb = pawn_bb & not_h_file & flip_bit(orthogonal_pinmask | nwse_pinmask)
             right_capture_target_bb = right_capture_pawn_bb >> 7 & opp_occupancy & checkmask
 
@@ -831,24 +834,26 @@ class Board:
 
             # captures to the right without promotion
             for target_sq in get_set_bits_idx(right_capture_target_bb & not_8_rank):
-                moves.append((target_sq + 7, target_sq, P, 0, 1, 0, 0, 0))
+                moves.append((target_sq + 7, target_sq, P, 0, self.get_captured_piece(target_sq), 0, 0, 0))
             # captures to the right with promotion
             for target_sq in get_set_bits_idx(right_capture_target_bb & rank_8):
-                moves.append((target_sq + 7, target_sq, P, Q, 1, 0, 0, 0))
-                moves.append((target_sq + 7, target_sq, P, N, 1, 0, 0, 0))
-                moves.append((target_sq + 7, target_sq, P, B, 1, 0, 0, 0))
-                moves.append((target_sq + 7, target_sq, P, R, 1, 0, 0, 0))
+                captured_piece = self.get_captured_piece(target_sq)
+                moves.append((target_sq + 7, target_sq, P, Q, captured_piece, 0, 0, 0))
+                moves.append((target_sq + 7, target_sq, P, N, captured_piece, 0, 0, 0))
+                moves.append((target_sq + 7, target_sq, P, B, captured_piece, 0, 0, 0))
+                moves.append((target_sq + 7, target_sq, P, R, captured_piece, 0, 0, 0))
             left_capture_pawn_bb = pawn_bb & not_a_file & flip_bit(orthogonal_pinmask | nesw_pinmask)
             left_capture_target_bb = left_capture_pawn_bb >> 9 & opp_occupancy & checkmask
             # captures to the left without promotion
             for target_sq in get_set_bits_idx(left_capture_target_bb & not_8_rank):
-                moves.append((target_sq + 9, target_sq, P, 0, 1, 0, 0, 0))
+                moves.append((target_sq + 9, target_sq, P, 0, self.get_captured_piece(target_sq), 0, 0, 0))
             # captures to the left with promotion
             for target_sq in get_set_bits_idx(left_capture_target_bb & rank_8):
-                moves.append((target_sq + 9, target_sq, P, Q, 1, 0, 0, 0))
-                moves.append((target_sq + 9, target_sq, P, N, 1, 0, 0, 0))
-                moves.append((target_sq + 9, target_sq, P, B, 1, 0, 0, 0))
-                moves.append((target_sq + 9, target_sq, P, R, 1, 0, 0, 0))
+                captured_piece = self.get_captured_piece(target_sq)
+                moves.append((target_sq + 9, target_sq, P, Q, captured_piece, 0, 0, 0))
+                moves.append((target_sq + 9, target_sq, P, N, captured_piece, 0, 0, 0))
+                moves.append((target_sq + 9, target_sq, P, B, captured_piece, 0, 0, 0))
+                moves.append((target_sq + 9, target_sq, P, R, captured_piece, 0, 0, 0))
             # Criteria for enpassant:
             # 1. Captured pawn in checkmask
             # 2. Own pawn not orthogonally pinned
@@ -861,11 +866,11 @@ class Board:
                 for source_sq in get_set_bits_idx(enpassant_source_bb):
                     if (1 << source_sq) & diagonal_pinmask and not 1 << self.enpassant & diagonal_pinmask:
                         continue
-                    if (1 << king_sq) & rank_5 and opp_rookqueen_bb & rank_5:
+                    if king_bb & rank_5 and opp_rookqueen_bb & rank_5:
                         new_both_occupancy = both_occupancy ^ ((1 << source_sq) | (1 << self.enpassant + 8))
                         if get_rook_attacks(king_sq, new_both_occupancy) & opp_rookqueen_bb:
                             continue
-                    moves.append((source_sq, self.enpassant, P, 0, 0, 0, 1, 0))
+                    moves.append((source_sq, self.enpassant, P, 0, P, 0, 1, 0))
 
             # CASTLING
             # kingside castle
@@ -874,14 +879,14 @@ class Board:
                 if not both_occupancy & 6917529027641081856:
                     # f and g squares between king's rook and king are not under attack
                     if not self.is_square_attacked(f1) and not self.is_square_attacked(g1) and not self.is_square_attacked(king_sq):
-                        moves.append((e1, g1, K, 0, 0, 0, 0, 1))
+                        moves.append((e1, g1, K, 0, -1, 0, 0, 1))
             # queenside castle
             if self.castle & wq:
                 # squares between queen's rook and king are unoccupied
                 if not both_occupancy & 1008806316530991104:
                     # squares between queen's rook and king are not under attack
                     if not self.is_square_attacked(c1) and not self.is_square_attacked(d1) and not self.is_square_attacked(king_sq):
-                        moves.append((e1, c1, K, 0, 0, 0, 0, 1))
+                        moves.append((e1, c1, K, 0, -1, 0, 0, 1))
 
         # self.side == BLACK
         else:
@@ -890,42 +895,44 @@ class Board:
             single_push_target_bb = single_push_pawn_bb << 8 & flip_bit(both_occupancy) & checkmask
             # single pawn pushes without promotion
             for target_sq in get_set_bits_idx(single_push_target_bb & not_1_rank):
-                moves.append((target_sq - 8, target_sq, P, 0, 0, 0, 0, 0))
+                moves.append((target_sq - 8, target_sq, P, 0, -1, 0, 0, 0))
             # single pawn pushes with promotion
             for target_sq in get_set_bits_idx(single_push_target_bb & rank_1):
-                moves.append((target_sq - 8, target_sq, P, Q, 0, 0, 0, 0))
-                moves.append((target_sq - 8, target_sq, P, R, 0, 0, 0, 0))
-                moves.append((target_sq - 8, target_sq, P, B, 0, 0, 0, 0))
-                moves.append((target_sq - 8, target_sq, P, N, 0, 0, 0, 0))
+                moves.append((target_sq - 8, target_sq, P, Q, -1, 0, 0, 0))
+                moves.append((target_sq - 8, target_sq, P, R, -1, 0, 0, 0))
+                moves.append((target_sq - 8, target_sq, P, B, -1, 0, 0, 0))
+                moves.append((target_sq - 8, target_sq, P, N, -1, 0, 0, 0))
 
             double_push_pawn_bb = single_push_pawn_bb & rank_7
             double_push_target_bb = (double_push_pawn_bb << 8 & flip_bit(both_occupancy)) << 8 & flip_bit(
                 both_occupancy) & checkmask
             # double pawn pushes
             for target_sq in get_set_bits_idx(double_push_target_bb):
-                moves.append((target_sq - 16, target_sq, P, 0, 0, 1, 0, 0))
+                moves.append((target_sq - 16, target_sq, P, 0, -1, 1, 0, 0))
             right_capture_pawn_bb = pawn_bb & not_a_file & flip_bit(orthogonal_pinmask | nwse_pinmask)
             right_capture_target_bb = right_capture_pawn_bb << 7 & opp_occupancy & checkmask
             # captures to the right without promotion
             for target_sq in get_set_bits_idx(right_capture_target_bb & not_1_rank):
-                moves.append((target_sq - 7, target_sq, P, 0, 1, 0, 0, 0))
+                moves.append((target_sq - 7, target_sq, P, 0, self.get_captured_piece(target_sq), 0, 0, 0))
             # captures  to the right with promotion
             for target_sq in get_set_bits_idx(right_capture_target_bb & rank_1):
-                moves.append((target_sq - 7, target_sq, P, Q, 1, 0, 0, 0))
-                moves.append((target_sq - 7, target_sq, P, N, 1, 0, 0, 0))
-                moves.append((target_sq - 7, target_sq, P, B, 1, 0, 0, 0))
-                moves.append((target_sq - 7, target_sq, P, R, 1, 0, 0, 0))
+                captured_piece = self.get_captured_piece(target_sq)
+                moves.append((target_sq - 7, target_sq, P, Q, captured_piece, 0, 0, 0))
+                moves.append((target_sq - 7, target_sq, P, N, captured_piece, 0, 0, 0))
+                moves.append((target_sq - 7, target_sq, P, B, captured_piece, 0, 0, 0))
+                moves.append((target_sq - 7, target_sq, P, R, captured_piece, 0, 0, 0))
             left_capture_pawn_bb = pawn_bb & not_h_file & flip_bit(orthogonal_pinmask | nesw_pinmask)
             left_capture_target_bb = left_capture_pawn_bb << 9 & opp_occupancy & checkmask
             # captures to the left without promotion
             for target_sq in get_set_bits_idx(left_capture_target_bb & not_1_rank):
-                moves.append((target_sq - 9, target_sq, P, 0, 1, 0, 0, 0))
+                moves.append((target_sq - 9, target_sq, P, 0, self.get_captured_piece(target_sq), 0, 0, 0))
             # captures to the left with promotion
             for target_sq in get_set_bits_idx(left_capture_target_bb & rank_1):
-                moves.append((target_sq - 9, target_sq, P, Q, 1, 0, 0, 0))
-                moves.append((target_sq - 9, target_sq, P, N, 1, 0, 0, 0))
-                moves.append((target_sq - 9, target_sq, P, B, 1, 0, 0, 0))
-                moves.append((target_sq - 9, target_sq, P, R, 1, 0, 0, 0))
+                captured_piece = self.get_captured_piece(target_sq)
+                moves.append((target_sq - 9, target_sq, P, Q, captured_piece, 0, 0, 0))
+                moves.append((target_sq - 9, target_sq, P, N, captured_piece, 0, 0, 0))
+                moves.append((target_sq - 9, target_sq, P, B, captured_piece, 0, 0, 0))
+                moves.append((target_sq - 9, target_sq, P, R, captured_piece, 0, 0, 0))
 
             # ENPASSANT
             if self.enpassant:
@@ -934,11 +941,11 @@ class Board:
                 for source_sq in get_set_bits_idx(enpassant_source_bb):
                     if (1 << source_sq) & diagonal_pinmask and not 1 << self.enpassant & diagonal_pinmask:
                         continue
-                    if (1 << king_sq) & rank_4 and opp_rookqueen_bb & rank_4:
+                    if king_bb & rank_4 and opp_rookqueen_bb & rank_4:
                         new_both_occupancy = both_occupancy ^ ((1 << source_sq) | (1 << (self.enpassant - 8)))
                         if get_rook_attacks(king_sq, new_both_occupancy) & opp_rookqueen_bb:
                             continue
-                    moves.append((source_sq, self.enpassant, P, 0, 0, 0, 1, 0))
+                    moves.append((source_sq, self.enpassant, P, 0, P, 0, 1, 0))
 
             # CASTLING
             # kingside castle
@@ -947,54 +954,54 @@ class Board:
                 if not both_occupancy & 96:
                     # f and g squares between king's rook and king are not under attack
                     if not self.is_square_attacked(f8) and not self.is_square_attacked(g8) and not self.is_square_attacked(king_sq):
-                        moves.append((e8, g8, K, 0, 0, 0, 0, 1))
+                        moves.append((e8, g8, K, 0, -1, 0, 0, 1))
             # queenside castle
             if self.castle & bq:
                 # squares between queen's rook and king are unoccupied
                 if not both_occupancy & 14:
                     # squares between queen's rook and king are not under attack
                     if not self.is_square_attacked(c8) and not self.is_square_attacked(d8) and not self.is_square_attacked(king_sq):
-                        moves.append((e8, c8, K, 0, 0, 0, 0, 1))
+                        moves.append((e8, c8, K, 0, -1, 0, 0, 1))
 
         # PIECE MOVES
 
         # KNIGHT MOVES
         for source_sq in get_set_bits_idx(knight_bb & flip_bit(pinmask)):
-            attacks = get_knight_attacks(source_sq) & checkmask & flip_bit(occupancy)
+            attacks = get_knight_attacks(source_sq) & checkmask
             # captures
             for target_sq in get_set_bits_idx(attacks & opp_occupancy):
-                moves.append((source_sq, target_sq, N, 0, 1, 0, 0, 0))
+                moves.append((source_sq, target_sq, N, 0, self.get_captured_piece(target_sq), 0, 0, 0))
             # quiet moves
             for target_sq in get_set_bits_idx(attacks & flip_bit(both_occupancy)):
-                moves.append((source_sq, target_sq, N, 0, 0, 0, 0, 0))
+                moves.append((source_sq, target_sq, N, 0, -1, 0, 0, 0))
 
         # BISHOP MOVES
         for source_sq in get_set_bits_idx(bishop_bb & flip_bit(orthogonal_pinmask)):
-            attacks = get_bishop_attacks(source_sq, both_occupancy) & checkmask & flip_bit(occupancy)
+            attacks = get_bishop_attacks(source_sq, both_occupancy) & checkmask
             if 1 << source_sq & diagonal_pinmask:
                 attacks &= diagonal_pinmask
             # captures
             for target_sq in get_set_bits_idx(attacks & opp_occupancy):
-                moves.append((source_sq, target_sq, B, 0, 1, 0, 0, 0))
+                moves.append((source_sq, target_sq, B, 0, self.get_captured_piece(target_sq), 0, 0, 0))
             # quiet  moves
             for target_sq in get_set_bits_idx(attacks & flip_bit(both_occupancy)):
-                moves.append((source_sq, target_sq, B, 0, 0, 0, 0, 0))
+                moves.append((source_sq, target_sq, B, 0, -1, 0, 0, 0))
 
         # ROOK MOVES
         for source_sq in get_set_bits_idx(rook_bb & flip_bit(diagonal_pinmask)):
-            attacks = get_rook_attacks(source_sq, both_occupancy) & checkmask & flip_bit(occupancy)
+            attacks = get_rook_attacks(source_sq, both_occupancy) & checkmask
             if 1 << source_sq & orthogonal_pinmask:
                 attacks &= orthogonal_pinmask
             # captures
             for target_sq in get_set_bits_idx(attacks & opp_occupancy):
-                moves.append((source_sq, target_sq, R, 0, 1, 0, 0, 0))
+                moves.append((source_sq, target_sq, R, 0, self.get_captured_piece(target_sq), 0, 0, 0))
             # quiet moves
             for target_sq in get_set_bits_idx(attacks & flip_bit(both_occupancy)):
-                moves.append((source_sq, target_sq, R, 0, 0, 0, 0, 0))
+                moves.append((source_sq, target_sq, R, 0, -1, 0, 0, 0))
 
         # QUEEN MOVES
         for source_sq in get_set_bits_idx(queen_bb):
-            attacks = get_queen_attacks(source_sq, both_occupancy) & checkmask & flip_bit(occupancy)
+            attacks = get_queen_attacks(source_sq, both_occupancy) & checkmask
             source_bb = 1 << source_sq
             if source_bb & pinmask:
                 if source_bb & horizontal_pinmask:
@@ -1007,23 +1014,218 @@ class Board:
                     attacks &= nwse_pinmask
             # captures
             for target_sq in get_set_bits_idx(attacks & opp_occupancy):
-                moves.append((source_sq, target_sq, Q, 0, 1, 0, 0, 0))
+                moves.append((source_sq, target_sq, Q, 0, self.get_captured_piece(target_sq), 0, 0, 0))
             # quiet moves
             for target_sq in get_set_bits_idx(attacks & flip_bit(both_occupancy)):
-                moves.append((source_sq, target_sq, Q, 0, 0, 0, 0, 0))
+                moves.append((source_sq, target_sq, Q, 0, -1, 0, 0, 0))
 
         # KING MOVES
-        self.occupancy[BOTH] ^= (1 << king_sq)
+        self.occupancy[BOTH] ^= king_bb
         # captures
         attacks = get_king_attacks(king_sq)
         for target_sq in get_set_bits_idx(attacks & opp_occupancy):
             if not self.is_square_attacked(target_sq):
-                moves.append((king_sq, target_sq, K, 0, 1, 0, 0, 0))
+                moves.append((king_sq, target_sq, K, 0, self.get_captured_piece(target_sq), 0, 0, 0))
         # quiet moves
         for target_sq in get_set_bits_idx(attacks & flip_bit(both_occupancy)):
             if not self.is_square_attacked(target_sq):
-                moves.append((king_sq, target_sq, K, 0, 0, 0, 0, 0))
-        self.occupancy[BOTH] ^= (1 << king_sq)
+                moves.append((king_sq, target_sq, K, 0, -1, 0, 0, 0))
+        self.occupancy[BOTH] ^= king_bb
+        return moves
+    def get_captured_piece(self, sq):
+        for piece, bb in enumerate(self.bitboards[not self.side]):
+            if bb & 1 << sq:
+                return piece
+
+    def get_captures(self):
+        moves = []
+        # get variables for the side to move
+        pawn_bb, knight_bb, bishop_bb, rook_bb, king_bb, queen_bb = self.bitboards[self.side]
+        opp_pawn_bb, opp_knight_bb, opp_bishop_bb, opp_rook_bb, opp_king_bb, opp_queen_bb = self.bitboards[not self.side]
+        opp_rookqueen_bb, opp_bishopqueen_bb = opp_rook_bb | opp_queen_bb, opp_bishop_bb | opp_queen_bb
+        occupancy, opp_occupancy, both_occupancy = self.occupancy[self.side], self.occupancy[not self.side], self.occupancy[BOTH]
+
+        # GENERATE CHECKMASK
+        king_sq = get_lsb_index(king_bb)
+        pawn_checkmask = get_pawn_attacks(self.side, king_sq) & opp_pawn_bb
+        knight_checkmask = get_knight_attacks(king_sq) & opp_knight_bb
+        opp_bishopqueen_attacks = get_bishop_attacks(king_sq, both_occupancy)
+        bishopqueen_checkmask = opp_bishopqueen_attacks & opp_bishopqueen_bb
+        opp_rookqueen_attacks = get_rook_attacks(king_sq, both_occupancy)
+        rookqueen_checkmask = opp_rookqueen_attacks & opp_rookqueen_bb
+        checkmask = pawn_checkmask | knight_checkmask | bishopqueen_checkmask | rookqueen_checkmask
+        check_count = count_bits(checkmask)
+
+        # no check
+        if check_count == 0:
+            checkmask = 0xFFFFFFFFFFFFFFFF
+
+        # double check
+        elif check_count == 2:
+            self.occupancy[BOTH] ^= king_bb
+            # captures
+            attacks = get_king_attacks(king_sq)
+            for target_sq in get_set_bits_idx(attacks & opp_occupancy):
+                if not self.is_square_attacked(target_sq):
+                    moves.append((king_sq, target_sq, K, 0, self.get_captured_piece(target_sq), 0, 0, 0))
+            self.occupancy[BOTH] ^= king_bb
+            return moves
+
+        # GENERATE PINMASK1
+        orthogonal_pinmask = 0
+        orthogonal_blockers = opp_rookqueen_attacks & occupancy
+        orthogonal_pinners = (get_rook_attacks(king_sq, both_occupancy ^ orthogonal_blockers) ^ opp_rookqueen_attacks) & opp_rookqueen_bb
+        for pinner in get_set_bits_idx(orthogonal_pinners):
+            pinmask = RECT_LOOKUP[pinner][king_sq]
+            orthogonal_pinmask |= pinmask
+        diagonal_pinmask = 0
+        diagonal_blockers = opp_bishopqueen_attacks & occupancy
+        diagonal_pinners = (get_bishop_attacks(king_sq, both_occupancy ^ diagonal_blockers) ^ opp_bishopqueen_attacks) & opp_bishopqueen_bb
+        for pinner in get_set_bits_idx(diagonal_pinners):
+            pinmask = RECT_LOOKUP[pinner][king_sq]
+            diagonal_pinmask |= pinmask
+
+        king_rank, king_file = divmod(king_sq, 8)
+        pinmask = diagonal_pinmask | orthogonal_pinmask
+        nesw_pinmask = NESW[king_rank + king_file] & diagonal_pinmask
+        nwse_pinmask = diagonal_pinmask ^ nesw_pinmask
+        horizontal_pinmask = RANKS[king_rank] & orthogonal_pinmask
+        vertical_pinmask = orthogonal_pinmask ^ horizontal_pinmask
+
+        # experirment  with more efficient silent pawn move generator
+
+        # Criteria for pawn pushes
+        # 1. Not diagonally pinned
+        # 2. Not horizontally pinned (can be vertically pinned)
+        # 3. No pieces blocking
+        # 4. Target square in checkmask
+
+        if self.side == WHITE:
+
+            right_capture_pawn_bb = pawn_bb & not_h_file & flip_bit(orthogonal_pinmask | nwse_pinmask)
+            right_capture_target_bb = right_capture_pawn_bb >> 7 & opp_occupancy & checkmask
+            # captures to the right without promotion
+            for target_sq in get_set_bits_idx(right_capture_target_bb & not_8_rank):
+                moves.append((target_sq + 7, target_sq, P, 0, self.get_captured_piece(target_sq), 0, 0, 0))
+            # captures to the right with promotion
+            for target_sq in get_set_bits_idx(right_capture_target_bb & rank_8):
+                captured_piece = self.get_captured_piece(target_sq)
+                moves.append((target_sq + 7, target_sq, P, Q, captured_piece, 0, 0, 0))
+                moves.append((target_sq + 7, target_sq, P, N, captured_piece, 0, 0, 0))
+                moves.append((target_sq + 7, target_sq, P, B, captured_piece, 0, 0, 0))
+                moves.append((target_sq + 7, target_sq, P, R, captured_piece, 0, 0, 0))
+            left_capture_pawn_bb = pawn_bb & not_a_file & flip_bit(orthogonal_pinmask | nesw_pinmask)
+            left_capture_target_bb = left_capture_pawn_bb >> 9 & opp_occupancy & checkmask
+            # captures to the left without promotion
+            for target_sq in get_set_bits_idx(left_capture_target_bb & not_8_rank):
+                moves.append((target_sq + 9, target_sq, P, 0, self.get_captured_piece(target_sq), 0, 0, 0))
+            # captures to the left with promotion
+            for target_sq in get_set_bits_idx(left_capture_target_bb & rank_8):
+                captured_piece = self.get_captured_piece(target_sq)
+                moves.append((target_sq + 9, target_sq, P, Q, captured_piece, 0, 0, 0))
+                moves.append((target_sq + 9, target_sq, P, N, captured_piece, 0, 0, 0))
+                moves.append((target_sq + 9, target_sq, P, B, captured_piece, 0, 0, 0))
+                moves.append((target_sq + 9, target_sq, P, R, captured_piece, 0, 0, 0))
+            # Criteria for enpassant:
+            # 1. Captured pawn in checkmask
+            # 2. Own pawn not orthogonally pinned
+            # 3. If diagonally pinned, own pawn can only en passant in direction of pin
+            # 4. If king and opposing rook or queen are on same rank as enpassant pawns, removing both pawns musn't result in check.
+
+            if self.enpassant:
+                enpassant_source_bb = get_pawn_attacks(not self.side, self.enpassant) & pawn_bb & flip_bit(
+                    orthogonal_pinmask)
+                for source_sq in get_set_bits_idx(enpassant_source_bb):
+                    if (1 << source_sq) & diagonal_pinmask and not 1 << self.enpassant & diagonal_pinmask:
+                        continue
+                    if king_bb & rank_5 and opp_rookqueen_bb & rank_5:
+                        new_both_occupancy = both_occupancy ^ ((1 << source_sq) | (1 << self.enpassant + 8))
+                        if get_rook_attacks(king_sq, new_both_occupancy) & opp_rookqueen_bb:
+                            continue
+                    moves.append((source_sq, self.enpassant, P, 0, P, 0, 1, 0))
+        # self.side == BLACK
+        else:
+            right_capture_pawn_bb = pawn_bb & not_a_file & flip_bit(orthogonal_pinmask | nwse_pinmask)
+            right_capture_target_bb = right_capture_pawn_bb << 7 & opp_occupancy & checkmask
+            # captures to the right without promotion
+            for target_sq in get_set_bits_idx(right_capture_target_bb & not_1_rank):
+                moves.append((target_sq - 7, target_sq, P, 0, self.get_captured_piece(target_sq), 0, 0, 0))
+            # captures  to the right with promotion
+            for target_sq in get_set_bits_idx(right_capture_target_bb & rank_1):
+                captured_piece = self.get_captured_piece(target_sq)
+                moves.append((target_sq - 7, target_sq, P, Q, captured_piece, 0, 0, 0))
+                moves.append((target_sq - 7, target_sq, P, N, captured_piece, 0, 0, 0))
+                moves.append((target_sq - 7, target_sq, P, B, captured_piece, 0, 0, 0))
+                moves.append((target_sq - 7, target_sq, P, R, captured_piece, 0, 0, 0))
+            left_capture_pawn_bb = pawn_bb & not_h_file & flip_bit(orthogonal_pinmask | nesw_pinmask)
+            left_capture_target_bb = left_capture_pawn_bb << 9 & opp_occupancy & checkmask
+            # captures to the left without promotion
+            for target_sq in get_set_bits_idx(left_capture_target_bb & not_1_rank):
+                moves.append((target_sq - 9, target_sq, P, 0, self.get_captured_piece(target_sq), 0, 0, 0))
+            # captures to the left with promotion
+            for target_sq in get_set_bits_idx(left_capture_target_bb & rank_1):
+                captured_piece = self.get_captured_piece(target_sq)
+                moves.append((target_sq - 9, target_sq, P, Q, captured_piece, 0, 0, 0))
+                moves.append((target_sq - 9, target_sq, P, N, captured_piece, 0, 0, 0))
+                moves.append((target_sq - 9, target_sq, P, B, captured_piece, 0, 0, 0))
+                moves.append((target_sq - 9, target_sq, P, R, captured_piece, 0, 0, 0))
+
+            # ENPASSANT
+            if self.enpassant:
+                enpassant_source_bb = get_pawn_attacks(not self.side, self.enpassant) & pawn_bb & flip_bit(
+                    orthogonal_pinmask)
+                for source_sq in get_set_bits_idx(enpassant_source_bb):
+                    if (1 << source_sq) & diagonal_pinmask and not 1 << self.enpassant & diagonal_pinmask:
+                        continue
+                    if king_bb & rank_4 and opp_rookqueen_bb & rank_4:
+                        new_both_occupancy = both_occupancy ^ ((1 << source_sq) | (1 << (self.enpassant - 8)))
+                        if get_rook_attacks(king_sq, new_both_occupancy) & opp_rookqueen_bb:
+                            continue
+                    moves.append((source_sq, self.enpassant, P, 0, P, 0, 1, 0))
+        # KNIGHT CAPTURES
+        for source_sq in get_set_bits_idx(knight_bb & flip_bit(pinmask)):
+            attacks = get_knight_attacks(source_sq) & checkmask & opp_occupancy
+            for target_sq in get_set_bits_idx(attacks):
+                moves.append((source_sq, target_sq, N, 0, self.get_captured_piece(target_sq), 0, 0, 0))
+
+        # BISHOP CAPTURES
+        for source_sq in get_set_bits_idx(bishop_bb & flip_bit(orthogonal_pinmask)):
+            attacks = get_bishop_attacks(source_sq, both_occupancy) & checkmask & opp_occupancy
+            if 1 << source_sq & diagonal_pinmask:
+                attacks &= diagonal_pinmask
+            for target_sq in get_set_bits_idx(attacks):
+                moves.append((source_sq, target_sq, B, 0, self.get_captured_piece(target_sq), 0, 0, 0))
+        # ROOK CAPTURES
+        for source_sq in get_set_bits_idx(rook_bb & flip_bit(diagonal_pinmask)):
+            attacks = get_rook_attacks(source_sq, both_occupancy) & checkmask & opp_occupancy
+            if 1 << source_sq & orthogonal_pinmask:
+                attacks &= orthogonal_pinmask
+            for target_sq in get_set_bits_idx(attacks):
+                moves.append((source_sq, target_sq, R, 0, self.get_captured_piece(target_sq), 0, 0, 0))
+
+        # QUEEN CAPTURES
+        for source_sq in get_set_bits_idx(queen_bb):
+            attacks = get_queen_attacks(source_sq, both_occupancy) & checkmask & opp_occupancy
+            source_bb = 1 << source_sq
+            if source_bb & pinmask:
+                if source_bb & horizontal_pinmask:
+                    attacks &= horizontal_pinmask
+                elif source_bb & vertical_pinmask:
+                    attacks &= vertical_pinmask
+                elif source_bb & nesw_pinmask:
+                    attacks &= nesw_pinmask
+                else:
+                    attacks &= nwse_pinmask
+            for target_sq in get_set_bits_idx(attacks):
+                moves.append((source_sq, target_sq, Q, 0, self.get_captured_piece(target_sq), 0, 0, 0))
+
+        # KING CAPTURES
+        self.occupancy[BOTH] ^= king_bb
+        attacks = get_king_attacks(king_sq) & opp_occupancy
+        for target_sq in get_set_bits_idx(attacks):
+            if not self.is_square_attacked(target_sq):
+                moves.append((king_sq, target_sq, K, 0, self.get_captured_piece(target_sq), 0, 0, 0))
+        self.occupancy[BOTH] ^= king_bb
         return moves
 
     def perft(self, max_depth, print_flag=True):
@@ -1060,7 +1262,7 @@ class Board:
             print(f'Nodes: {total_count}')
         return perft_divide
 
-    def make_move(self, move, all_moves=True):
+    def make_move(self, move):
         source_sq, target_sq, piece, promote, capture, double, enpass, castle = move
         source_bb, target_bb = 1 << source_sq, 1 << target_sq
         move_bb = source_bb | target_bb
@@ -1069,49 +1271,45 @@ class Board:
         unmake = []
         self.enpassant_states.append(self.enpassant)
         self.castle_states.append(self.castle)
-        if all_moves:
-            bbs[piece] ^= move_bb
-            self.occupancy[self.side] ^= move_bb
-            unmake.append((self.side, piece, move_bb))
-            if capture:
-                for piece, piece_bb in enumerate(opp_bbs):
-                    if piece_bb & target_bb:
-                        opp_bbs[piece] ^= target_bb
-                        self.occupancy[not self.side] ^= target_bb
-                        unmake.append((not self.side, piece, target_bb))
-                        break
-            if promote:
-                bbs[P] ^= target_bb
-                bbs[promote] ^= target_bb
-                unmake.append((self.side, P, target_bb))
-                unmake.append((self.side, promote, target_bb))
-            if enpass:
-                ep_target_bb = 1 << (target_sq - pawn_dir)
-                opp_bbs[P] ^= ep_target_bb
-                self.occupancy[not self.side] ^= ep_target_bb
-                unmake.append((not self.side, P, ep_target_bb))
-            if double:
-                self.enpassant = target_sq - pawn_dir
-            else:
-                self.enpassant = 0
-            if castle:
-                if self.side == WHITE:
-                    if target_sq == g1:
-                        rook_move_bb = (1 << h1 | 1 << f1)
-                    else:
-                        rook_move_bb = (1 << a1 | 1 << d1)
+        bbs[piece] ^= move_bb
+        self.occupancy[self.side] ^= move_bb
+        unmake.append((self.side, piece, move_bb))
+        if capture != -1:
+            opp_bbs[capture] ^= target_bb
+            self.occupancy[not self.side] ^= target_bb
+            unmake.append((not self.side, capture, target_bb))
+        if promote:
+            bbs[P] ^= target_bb
+            bbs[promote] ^= target_bb
+            unmake.append((self.side, P, target_bb))
+            unmake.append((self.side, promote, target_bb))
+        if enpass:
+            ep_target_bb = (1 << target_sq | 1 << (target_sq - pawn_dir))
+            opp_bbs[P] ^= ep_target_bb
+            self.occupancy[not self.side] ^= ep_target_bb
+            unmake.append((not self.side, P, ep_target_bb))
+        if double:
+            self.enpassant = target_sq - pawn_dir
+        else:
+            self.enpassant = 0
+        if castle:
+            if self.side == WHITE:
+                if target_sq == g1:
+                    rook_move_bb = (1 << h1 | 1 << f1)
                 else:
-                    if target_sq == g8:
-                        rook_move_bb = (1 << h8 | 1 << f8)
-                    else:
-                        rook_move_bb = (1 << a8 | 1 << d8)
-                bbs[R] ^= rook_move_bb
-                self.occupancy[self.side] ^= rook_move_bb
-                unmake.append((self.side, R, rook_move_bb))
-            self.castle &= CASTLING_RIGHTS[target_sq] & CASTLING_RIGHTS[source_sq]
-            self.occupancy[BOTH] = self.occupancy[WHITE] | self.occupancy[BLACK]
-            self.unmake_stack.append(unmake)
-            self.side = not self.side
+                    rook_move_bb = (1 << a1 | 1 << d1)
+            else:
+                if target_sq == g8:
+                    rook_move_bb = (1 << h8 | 1 << f8)
+                else:
+                    rook_move_bb = (1 << a8 | 1 << d8)
+            bbs[R] ^= rook_move_bb
+            self.occupancy[self.side] ^= rook_move_bb
+            unmake.append((self.side, R, rook_move_bb))
+        self.castle &= CASTLING_RIGHTS[target_sq] & CASTLING_RIGHTS[source_sq]
+        self.occupancy[BOTH] = self.occupancy[WHITE] | self.occupancy[BLACK]
+        self.unmake_stack.append(unmake)
+        self.side = not self.side
 
     def unmake_move(self):
         for side, piece, move_bb in self.unmake_stack.pop():
@@ -1141,52 +1339,68 @@ class Board:
     def negamax_search(self, depth):
         self.ply = 0
         self.nodes = 0
-        best_move = 0
-        best_so_far = float('-inf')
-        for move in self.get_moves():
-            self.make_move(move)
-            value = -self.negamax_driver(float('-inf'), float('inf'), depth - 1)
-            self.unmake_move()
-            if value > best_so_far:
-                best_so_far = value
-                best_move = move
+        score = -self.negamax_driver(float('-inf'), float('inf'), depth)
+        pv = [to_uci(move) for move in self.pv_table[0][:self.pv_length[0]]]
+        best_move = pv[0]
+        pv = ' '.join(pv)
         return {
-            'bestmove': to_uci(best_move),
+            'bestmove': best_move,
             'depth': depth,
             'nodes': self.nodes,
-            'cp': best_so_far
+            'cp': score,
+            'pv': pv
         }
     def negamax_driver(self, alpha, beta, depth):
-        self.nodes += 1
+        self.pv_length[self.ply] = self.ply
         if depth == 0:
-            return self.q_search(-beta, -alpha)
+            return self.q_search(alpha, beta)
+        self.nodes += 1
+        # Increase search depth if king is in check
+        in_check = self.is_square_attacked(get_lsb_index(self.bitboards[self.side][K]))
+        if in_check:
+            depth += 1
         best_so_far = float('-inf')
         moves = self.get_moves()
-        for move in moves:
+        for move in self.native_sort_moves(moves):
+            # Searching into deeper ply
             self.ply += 1
             self.make_move(move)
+            # Recurse
             value = -self.negamax_driver(-beta, -alpha, depth - 1)
+            # Returning to original ply
             self.ply -= 1
             self.unmake_move()
             if value > best_so_far:
                 best_so_far = value
+            # cutnode
             if best_so_far > beta:
+                if not move[4]: # move is not a capture
+                    self.killer_moves[1][self.ply] = self.killer_moves[0][self.ply]
+                    self.killer_moves[0][self.ply] = move
                 return best_so_far
-            alpha = max(alpha, best_so_far)
+            # pv node
+            if best_so_far > alpha:
+                if not move[4]: # move is not a capture
+                    self.history_moves[move[2]][move[1]] += depth
+                next_ply = self.ply + 1
+                last_ply = self.pv_length[next_ply]
+                self.pv_table[self.ply][self.ply] = move
+                self.pv_table[self.ply][next_ply: last_ply] = self.pv_table[next_ply][next_ply: last_ply]
+                self.pv_length[self.ply] = self.pv_length[next_ply]
+                # update alpha
+                alpha = best_so_far
         if len(moves) == 0:
-            king_sq = get_lsb_index(self.bitboards[self.side][K])
-            if self.is_square_attacked(king_sq):
+            if in_check:
                 return -49000 + self.ply
             else:
                 return 0
         return best_so_far
-    def get_captures(self):
-        return [move for move in self.get_moves() if move[4]]
+
     def q_search(self, alpha, beta):
         self.nodes += 1
         eval = self.evaluate()
         if eval > beta:
-            return beta
+            return eval
         best_so_far = eval
         for move in self.get_captures():
             self.ply += 1
@@ -1200,6 +1414,26 @@ class Board:
                 return best_so_far
             alpha = max(alpha, best_so_far)
         return best_so_far
+    def score_move(self, move):
+        _, target_sq, piece, _, captured_piece = move[:5]
+        if captured_piece != -1:
+            return MVV_LVA[piece][captured_piece] + 10000
+        elif self.killer_moves[0][self.ply] == move:
+            return 9000
+        elif self.killer_moves[1][self.ply] == move:
+            return 8000
+        else:
+            return self.history_moves[piece][target_sq]
+    def heapq_sort_moves(self, moves):
+        sorted_moves = [(-self.score_move(move), move) for move in moves]
+        heapq.heapify(sorted_moves)
+        for i in range(len(moves)):
+            yield sorted_moves.heappop()[1]
+    def native_sort_moves(self, moves):
+        return sorted(moves, key=self.score_move, reverse=True)
+
+
+
 
 
 def encode_move(source, target, piece, promoted, capture, double, enpassant, castling):
@@ -1302,7 +1536,7 @@ def uci_loop():
                 depth = int(cmds[2])
                 # search(depth)
                 best_move_dict = board.negamax_search(depth)
-                print('info score cp {cp} depth {depth} nodes {nodes} \nbestmove {bestmove}'.format(**best_move_dict))
+                print('info cp {cp} depth {depth} nodes {nodes} pv {pv} \nbestmove {bestmove}'.format(**best_move_dict))
             elif cmds[1] == 'perft':
                 depth = int(cmds[2])
                 board.perft_divide(depth)
@@ -1418,7 +1652,8 @@ def horizontal_flip(psq):
 WHITE_PSQ = [P_psq, N_psq, B_psq, R_psq, K_psq, Q_psq]
 BLACK_PSQ = [p_psq, n_psq, b_psq, r_psq, k_psq, q_psq] = [horizontal_flip(psq) for psq in WHITE_PSQ]
 
-
+debug_pos = 'r3k1r1/p1ppNp2/1n3b2/3p4/1p2P3/2N5/PPPB1P1P/R4BK1 b q - 0 1'
+debug_pos2 = 'r3k1r1/p1ppNp2/1n3b2/3p4/1p2P3/2N5/PPPB1P1P/R4B1K w q - 0 1'
 if __name__ == '__main__':
     uci_loop()
 

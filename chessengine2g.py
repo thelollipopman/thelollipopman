@@ -574,8 +574,11 @@ class Board:
         self.side = 0
         self.enpassant = 0
         self.castle = 0
+        self.piece_hash = 0
+        self.board_hash = 0
         self.enpassant_states = []
         self.castle_states = []
+        self.board_hash_states = []
         self.unmake_stack = []
         # search tables
         self.nodes = 0
@@ -586,15 +589,9 @@ class Board:
         self.pv_table = [[0 for ply in range(MAX_PLY)] for ply in range(MAX_PLY)]
         # flags
         self.follow_pv = False
-        self.stop = False
-        # UCI options
-        self.movestogo = 30
-        self.movetime = -1
-        self.time = -1
-        self.inc = 0
-        self.starttime = 0
-        self.stoptime = 0
-        self.timeset = 0
+        self.stopped = False
+        # transposition table
+        self.transposition_table = dict()
 
     def print_board(self):
         for rank in range(8):
@@ -690,6 +687,9 @@ class Board:
         self.occupancy[BOTH] = self.occupancy[WHITE] | self.occupancy[BLACK]
         self.castle_states.append(self.castle)
         self.enpassant_states.append(self.enpassant)
+        self.piece_hash = self.generate_hash_key(pieces_only=True)
+        self.board_hash = self.generate_hash_key()
+        self.board_hash_states.append(self.board_hash)
 
     def get_fen(self):
         position = ''
@@ -909,7 +909,8 @@ class Board:
                 # squares between king's rook and king are unoccupied
                 if not both_occupancy & 6917529027641081856:
                     # f and g squares between king's rook and king are not under attack
-                    if not self.is_square_attacked(f1) and not self.is_square_attacked(g1) and not self.is_square_attacked(
+                    if not self.is_square_attacked(f1) and not self.is_square_attacked(
+                            g1) and not self.is_square_attacked(
                             king_sq):
                         quiet_moves.append((e1, g1, K, 0, -1, 0, 0, 1))
             # queenside castle
@@ -917,7 +918,8 @@ class Board:
                 # squares between queen's rook and king are unoccupied
                 if not both_occupancy & 1008806316530991104:
                     # squares between queen's rook and king are not under attack
-                    if not self.is_square_attacked(c1) and not self.is_square_attacked(d1) and not self.is_square_attacked(
+                    if not self.is_square_attacked(c1) and not self.is_square_attacked(
+                            d1) and not self.is_square_attacked(
                             king_sq):
                         quiet_moves.append((e1, c1, K, 0, -1, 0, 0, 1))
 
@@ -986,7 +988,8 @@ class Board:
                 # squares between king's rook and king are unoccupied
                 if not both_occupancy & 96:
                     # f and g squares between king's rook and king are not under attack
-                    if not self.is_square_attacked(f8) and not self.is_square_attacked(g8) and not self.is_square_attacked(
+                    if not self.is_square_attacked(f8) and not self.is_square_attacked(
+                            g8) and not self.is_square_attacked(
                             king_sq):
                         quiet_moves.append((e8, g8, K, 0, -1, 0, 0, 1))
             # queenside castle
@@ -994,7 +997,8 @@ class Board:
                 # squares between queen's rook and king are unoccupied
                 if not both_occupancy & 14:
                     # squares between queen's rook and king are not under attack
-                    if not self.is_square_attacked(c8) and not self.is_square_attacked(d8) and not self.is_square_attacked(
+                    if not self.is_square_attacked(c8) and not self.is_square_attacked(
+                            d8) and not self.is_square_attacked(
                             king_sq):
                         quiet_moves.append((e8, c8, K, 0, -1, 0, 0, 1))
 
@@ -1071,21 +1075,21 @@ class Board:
         else:
             return captures + quiet_moves
 
-
     def get_captured_piece(self, sq):
         for piece, bb in enumerate(self.bitboards[not self.side]):
             if bb & 1 << sq:
                 return piece
 
-
     def get_captures(self):
         moves = []
         # get variables for the side to move
         pawn_bb, knight_bb, bishop_bb, rook_bb, king_bb, queen_bb = self.bitboards[self.side]
-        opp_pawn_bb, opp_knight_bb, opp_bishop_bb, opp_rook_bb, opp_king_bb, opp_queen_bb = self.bitboards[not self.side]
+        opp_pawn_bb, opp_knight_bb, opp_bishop_bb, opp_rook_bb, opp_king_bb, opp_queen_bb = self.bitboards[
+            not self.side]
         opp_rookqueen_bb, opp_bishopqueen_bb = opp_rook_bb | opp_queen_bb, opp_bishop_bb | opp_queen_bb
-        occupancy, opp_occupancy, both_occupancy = self.occupancy[self.side], self.occupancy[not self.side], self.occupancy[
-            BOTH]
+        occupancy, opp_occupancy, both_occupancy = self.occupancy[self.side], self.occupancy[not self.side], \
+                                                   self.occupancy[
+                                                       BOTH]
 
         # GENERATE CHECKMASK
         king_sq = get_lsb_index(king_bb)
@@ -1271,7 +1275,6 @@ class Board:
         self.occupancy[BOTH] ^= king_bb
         return moves
 
-
     def perft(self, max_depth, print_flag=True):
         self.reset_var()
         start = time.time()
@@ -1283,21 +1286,29 @@ class Board:
             print(f'Time: {timing}')
         return nodes, timing
 
-
     def perft_driver(self, depth):
         if depth == 0:
             self.nodes += 1
             return
-        for move in self.get_moves():
+        for move in self.get_moves(separate_captures=False):
             self.make_move(move)
+            correct_hash = self.generate_hash_key()
+            if correct_hash != self.board_hash:
+                self.print_board()
+                print(f'correct hash {correct_hash} \nwrong hash {self.board_hash}')
+                input()
             self.perft_driver(depth - 1)
             self.unmake_move()
 
-
     def perft_divide(self, max_depth, print_flag=True):
         perft_divide = {}
-        for move in self.get_moves():
+        for move in self.get_moves(separate_captures=False):
             self.make_move(move)
+            correct_hash = self.generate_hash_key()
+            if correct_hash != self.board_hash:
+                self.print_board()
+                print(f'correct hash {correct_hash} \nwrong hash {self.board_hash}')
+                input()
             perft_divide[move] = self.perft(max_depth - 1, print_flag=False)[0]
             self.unmake_move()
         if print_flag:
@@ -1308,46 +1319,88 @@ class Board:
             print(f'Nodes: {total_count}')
         return perft_divide
 
-
     def make_move(self, move):
         source_sq, target_sq, piece, promote, capture, double, enpass, castle = move
         source_bb, target_bb = 1 << source_sq, 1 << target_sq
         move_bb = source_bb | target_bb
         bbs, opp_bbs = self.bitboards[self.side], self.bitboards[not self.side]
         pawn_dir = 8 if self.side else -8
-        unmake = []
+        # Store previous board states
         self.enpassant_states.append(self.enpassant)
         self.castle_states.append(self.castle)
-        bbs[piece] ^= move_bb
-        self.occupancy[self.side] ^= move_bb
-        unmake.append((self.side, piece, move_bb))
-        if capture != -1:
-            opp_bbs[capture] ^= target_bb
-            self.occupancy[not self.side] ^= target_bb
-            unmake.append((not self.side, capture, target_bb))
+        self.board_hash_states.append(self.board_hash)
+        # XOR away old enpassant and castling states from zobrist hash
+        if self.enpassant:
+            self.board_hash ^= ENPASSANT_KEYS[self.enpassant]
+        self.board_hash ^= CASTLE_KEYS[self.castle]
+        unmake = []
         if promote:
+            bbs[P] ^= source_bb
+            bbs[promote] ^= target_bb
+            self.board_hash ^= PIECE_KEYS[self.side][P][source_sq] ^ PIECE_KEYS[self.side][promote][target_sq]
+            unmake.append((self.side, P, source_bb))
+            unmake.append((self.side, promote, target_bb))
+        else:
+            bbs[piece] ^= move_bb
+            self.board_hash ^= PIECE_KEYS[self.side][piece][source_sq] ^ PIECE_KEYS[self.side][piece][target_sq]
+            unmake.append((self.side, piece, move_bb))
+        self.occupancy[self.side] ^= move_bb
+        if capture != -1:
+            if enpass:
+                ep_target_sq = target_sq - pawn_dir
+                ep_target_bb = 1 << ep_target_sq
+                opp_bbs[P] ^= ep_target_bb
+                self.occupancy[not self.side] ^= ep_target_bb
+                self.board_hash ^= PIECE_KEYS[not self.side][capture][ep_target_sq]
+                unmake.append((not self.side, P, ep_target_bb))
+            else:
+                opp_bbs[capture] ^= target_bb
+                self.occupancy[not self.side] ^= target_bb
+                self.board_hash ^= PIECE_KEYS[not self.side][capture][target_sq]
+                unmake.append((not self.side, capture, target_bb))
+        '''if promote:
             bbs[P] ^= target_bb
             bbs[promote] ^= target_bb
             unmake.append((self.side, P, target_bb))
             unmake.append((self.side, promote, target_bb))
+            self.piece_hash ^= PIECE_KEYS[self.side][P][target_sq]
+            self.piece_hash ^= PIECE_KEYS[self.side][promote][target_sq]
         if enpass:
             ep_target_bb = (1 << target_sq | 1 << (target_sq - pawn_dir))
             opp_bbs[P] ^= ep_target_bb
             self.occupancy[not self.side] ^= ep_target_bb
-            unmake.append((not self.side, P, ep_target_bb))
+            unmake.append((not self.side, P, ep_target_bb))'''
+        # En passant square is always empty unless previous move was a double pawn push
         if double:
             self.enpassant = target_sq - pawn_dir
         else:
             self.enpassant = 0
+        # In addition to the king bitboard, update rook bitboards when castling
         if castle:
-            rook_move_bb = ROOK_MOVES[target_sq]
+            if self.side == WHITE:
+                if target_sq == g1:
+                    rook_source_sq, rook_target_sq = h1, f1
+                else:
+                    rook_source_sq, rook_target_sq = a1, d1
+            else:
+                if target_sq == g8:
+                    rook_source_sq, rook_target_sq = h8, f8
+                else:
+                    rook_source_sq, rook_target_sq = a8, d8
+            rook_move_bb = (1 << rook_source_sq | 1 << rook_target_sq)
             bbs[R] ^= rook_move_bb
             self.occupancy[self.side] ^= rook_move_bb
+            self.board_hash ^= PIECE_KEYS[self.side][R][rook_source_sq] ^ PIECE_KEYS[self.side][R][rook_target_sq]
             unmake.append((self.side, R, rook_move_bb))
+        # Update castling rights
         self.castle &= CASTLING_RIGHTS[target_sq] & CASTLING_RIGHTS[source_sq]
         self.occupancy[BOTH] = self.occupancy[WHITE] | self.occupancy[BLACK]
         self.unmake_stack.append(unmake)
         self.side = not self.side
+        # XOR new enpassant and castle states, as well as side key
+        if self.enpassant:
+            self.board_hash ^= ENPASSANT_KEYS[self.enpassant]
+        self.board_hash ^= CASTLE_KEYS[self.castle] ^ SIDE_KEY
 
 
     def unmake_move(self):
@@ -1358,13 +1411,12 @@ class Board:
         self.enpassant = self.enpassant_states.pop()
         self.castle = self.castle_states.pop()
         self.side = not self.side
-
+        self.board_hash = self.board_hash_states.pop()
 
     def parse_movestr(self, move_str):
         for move in self.get_moves():
             if move_str == to_uci(move):
                 return move
-
 
     def evaluate(self):
         score = 0
@@ -1380,36 +1432,39 @@ class Board:
     def timeout(self, secs):
         def timeout_driver():
             time.sleep(secs)
-            self.stop = True
-        t = threading.Thread
-        
+            self.stopped = True
+        t = threading.Thread(target=timeout_driver)
+        t.start()
 
     def iterative_deepening_search(self, depth, print_flag=True, timeout=None):
         self.reset_var()
+        self.stopped = False
+        if timeout:
+            self.timeout(timeout)
         infos = []
         alpha, beta = -50000, 50000
-        
         for current_depth in range(1, depth + 1):
+            if self.stopped == True:
+                break
             self.follow_pv = True
             info = self.negamax_search(current_depth, alpha, beta, print_flag=print_flag)
             score = info['cp']
-            if not alpha  < score < beta:
-                alpha =  -50000
+            if not alpha < score < beta:
+                alpha = -50000
                 beta = 50000
                 continue
             alpha -= 50
             beta += 50
             infos.append(info)
         if print_flag == True:
-            bestmove = infos[-1]['bestmove']
+            bestmove = infos[-1]['pv'][:4]
             timing = infos[-1]['time']
             print('bestmove {}'.format(bestmove))
             print(timing)
         return infos
 
-
     def negamax_search(self, depth, alpha=-50000, beta=50000, print_flag=True):
-        # Reset ply and nodes counter
+        # Reset ply, nodes counter
         self.ply, self.nodes = 0, 0
         start_time = time.time()
         score = self.negamax_driver2(alpha, beta, depth)
@@ -1425,7 +1480,6 @@ class Board:
         if print_flag == True:
             print('info cp {cp} depth {depth} nodes {nodes} pv {pv}'.format(**info))
         return info
-
 
     def negamax_driver(self, alpha, beta, depth):
         self.pv_length[self.ply] = self.ply
@@ -1473,7 +1527,6 @@ class Board:
                 return 0
         return best_so_far
 
-
     def q_search(self, alpha, beta):
         self.nodes += 1
         eval = self.evaluate()
@@ -1493,8 +1546,11 @@ class Board:
             alpha = max(alpha, best_so_far)
         return best_so_far
 
-
     def negamax_driver2(self, alpha, beta, depth):
+        hash_flag = ALPHA_FLAG
+        hash_entry_score = self.read_hash_entry(alpha, beta, depth)
+        #if hash_entry_score != None:
+            #return hash_entry_score
         self.pv_length[self.ply] = self.ply
         if depth == 0:
             return self.q_search2(alpha, beta)
@@ -1505,10 +1561,24 @@ class Board:
             depth += 1
         # Criteria for Null Move Pruning
         if depth >= 3 and in_check == False and self.ply > 0:
+            # Switch sides
             self.side = not self.side
-            self.enpassant == 0
+            self.board_hash ^= SIDE_KEY
+            # Disable enpassant
+            if self.enpassant:
+                self.board_hash ^= ENPASSANT_KEYS[self.enpassant]
+            prev_enpassant = self.enpassant
+            self.enpassant = 0
             value = - self.negamax_driver2(-beta, -beta + 1, depth - 1 - 2)
+            # Restore side
             self.side = not self.side
+            self.board_hash ^= SIDE_KEY
+            # Restore enpassant
+            self.enpassant = prev_enpassant
+            if self.enpassant:
+                self.board_hash ^= ENPASSANT_KEYS[self.enpassant]
+            if self.stopped == True:
+                return 0
             if value >= beta:
                 return beta
         move_count = 0
@@ -1519,13 +1589,6 @@ class Board:
             self.ply += 1
             self.make_move(move)
             # First move must be searched at full depth
-
-            '''if found_pv:
-                value = - self.negamax_driver2(-alpha - 1, -alpha, depth - 1)
-                if alpha < value < beta:
-                    value = - self.negamax_driver2(-beta, - alpha, depth - 1)
-            else:
-                value = - self.negamax_driver2(-beta, -alpha, depth - 1)'''
             if move_count == 0:
                 value = -self.negamax_driver2(-beta, -alpha, depth - 1)
             else:
@@ -1543,11 +1606,15 @@ class Board:
             self.ply -= 1
             self.unmake_move()
             move_count += 1
+            if self.stopped == True:
+                return 0
             # cutnode
             if value >= beta:
-                if capture == -1:  # move is not a capture
+                # Add move to list of killer moves if not a capture
+                if capture == -1:
                     self.killer_moves[1][self.ply] = self.killer_moves[0][self.ply]
                     self.killer_moves[0][self.ply] = move
+                self.transposition_table[self.board_hash] = (beta, depth, BETA_FLAG)
                 return beta
             # pv node
             if value > alpha:
@@ -1555,6 +1622,7 @@ class Board:
                     self.history_moves[piece][target_sq] += depth
                 # update alpha
                 alpha = value
+                hash_flag = ALPHA_FLAG
                 # update pv_table
                 next_ply = self.ply + 1
                 last_ply = self.pv_length[next_ply]
@@ -1568,8 +1636,8 @@ class Board:
             # stalemate
             else:
                 return 0
+        self.transposition_table[self.board_hash] = (alpha, depth, hash_flag)
         return alpha
-
 
     def q_search2(self, alpha, beta):
         self.nodes += 1
@@ -1584,12 +1652,13 @@ class Board:
             value = -self.q_search2(-beta, -alpha)
             self.ply -= 1
             self.unmake_move()
+            if self.stopped == True:
+                return 0
             if value >= beta:
                 return beta
             if value > alpha:
                 alpha = value
         return alpha
-
 
     def score_move(self, move):
         _, target_sq, piece, _, captured_piece = move[:5]
@@ -1602,13 +1671,11 @@ class Board:
         else:
             return self.history_moves[piece][target_sq]
 
-
     def heapq_sort_moves(self, moves):
         sorted_moves = [(-self.score_move(move), move) for move in moves]
         heapq.heapify(sorted_moves)
         for i in range(len(moves)):
             yield sorted_moves.heappop()[1]
-
 
     def native_sort_moves(self, moves):
         return sorted(moves, key=self.score_move, reverse=True)
@@ -1633,12 +1700,13 @@ class Board:
         if self.follow_pv:
             pv_move = self.pv_table[0][self.ply]
             if pv_move:
-                yield pv_move
                 # pv move is a capture
                 if pv_move in captures:
+                    yield pv_move
                     captures.remove(pv_move)
                 # pv move is a quiet move
-                else:
+                elif pv_move in quiet_moves:
+                    yield pv_move
                     quiet_moves.remove(pv_move)
             else:
                 self.follow_pv = False
@@ -1655,6 +1723,30 @@ class Board:
         for move in sorted(quiet_moves, key=self.score_quiet_move, reverse=True):
             yield move
 
+    def generate_hash_key(self, pieces_only=False):
+        hash_key = 0
+        for side, bbs in enumerate(self.bitboards):
+            for piece, bb in enumerate(bbs):
+                for sq in get_set_bits_idx(bb):
+                    hash_key ^= PIECE_KEYS[side][piece][sq]
+        if pieces_only == True:
+            return hash_key
+        if self.enpassant:
+            hash_key ^= ENPASSANT_KEYS[self.enpassant]
+        hash_key ^= CASTLE_KEYS[self.castle] ^ (self.side * SIDE_KEY)
+        return hash_key
+
+    def read_hash_entry(self, alpha, beta, depth):
+        entry_score, entry_depth, entry_flag = self.transposition_table.get(self.board_hash, (0, -1, 0))
+        if entry_depth >= depth:
+            if entry_flag == EXACT_FLAG:
+                return entry_score
+            elif entry_flag == ALPHA_FLAG:
+                if entry_score <= alpha:
+                    return alpha
+            else:
+                if entry_score >= beta:
+                    return beta
 
 
 
@@ -1744,12 +1836,14 @@ def debug_perft(fen, depth):
                 break
     print('No bugs')
 
+
 depth_re = re.compile('(?<=depth )[0-9]+')
 perft_re = re.compile('(?<=perft )[0-9]+')
 inc_re = re.compile('(?<=(winc |binc ))[0-9]+')
 time_re = re.compile('(?<=(wtime |btime ))[0-9]+')
 movetime_re = re.compile('(?<=movetime )[0-9]+')
 movestogo_re = re.compile('(?<=movestogo )[0-9]+')
+
 
 def get_arg(regex, strng):
     match = regex.search(strng)
@@ -1758,31 +1852,33 @@ def get_arg(regex, strng):
     else:
         return None
 
+
 def uci_loop():
     board = Board()
     print('id name IdiotSandwich')
     print('id author Cheng Yong')
     print('uciok')
     while True:
-        cmd = input().strip(' ')
-        cmd,  args = cmd.split(' ', 1)
+        cmds = input()
+        board.stopped = True
+        cmds = cmds.strip(' ').split(' ')
+        cmd, args = cmds[0], cmds[1:]
         if cmd == 'go':
             movestogo = 30
             depth = 64
+            perft = 0
             inc, time, movetime = 0, 0, 0
-            args = args.split(' ')
             for i, arg in enumerate(args):
                 if arg == 'depth':
                     depth = int(args[i + 1])
                 elif arg == 'perft':
                     perft = int(args[i + 1])
-                    break
                 elif arg == 'binc' or arg == 'winc':
                     inc = int(args[i + 1])
                 elif arg == 'wtime' or arg == 'btime':
                     time = int(args[i + 1])
                 elif arg == 'movetime':
-                    movetime  = int(args[i + 1])
+                    movetime = int(args[i + 1])
                     time = movetime
                     movestogo = 1
                 elif arg == 'movestogo':
@@ -1792,23 +1888,26 @@ def uci_loop():
             else:
                 if time:
                     time /= movestogo
-                    time -= 100
-                board.iterative_deepening_search(depth)
+                    time -= 50
+                    time += inc
+                    time /= 1000
+                search_thread = threading.Thread(target=board.iterative_deepening_search, args=[depth, True, time])
+                search_thread.start()
         elif cmd == 'position':
-            if args.startswith('startpos'):
+            if args[0] == 'startpos':
                 board.parse_fen(start_pos)
-            elif args.startswith('fen'):
-                fen = args[4:]
+            elif args[0] == 'fen':
+                fen = ' '.join(args[1:])
                 board.parse_fen(fen)
-        elif keyword == 'ucinewgame':
+        elif cmd == 'ucinewgame':
             board.parse_fen(start_pos)
-        elif keyword == 'uci':
+        elif cmd == 'uci':
             print('uciok')
-        elif keyword == 'isready':
+        elif cmd == 'isready':
             print('readyok')
-        elif keyword == 'quit':
+        elif cmd == 'quit':
             break
-        elif keyword == 'd':
+        elif cmd == 'd':
             board.print_board()
 
 
@@ -1919,10 +2018,31 @@ ROOK_MOVES = {
     c8: (1 << a8 | 1 << d8)
 }
 
+PIECE_KEYS = [[[0 for sq in range(64)] for piece in range(6)] for side in range(2)]
+ENPASSANT_KEYS = [0 for sq in range(64)]
+SIDE_KEY = 0
+CASTLE_KEYS = [0 for i in range(16)]
+
+def init_zobrist_keys():
+    global SIDE_KEY
+    for side in range(2):
+        for piece in range(6):
+            for sq in range(64):
+                PIECE_KEYS[side][piece][sq] = get_random_64int()
+    for sq in range(64):
+        ENPASSANT_KEYS[sq] = get_random_64int()
+    for i in range(16):
+        CASTLE_KEYS[i] = get_random_64int()
+    SIDE_KEY = get_random_64int()
+
+EXACT_FLAG, ALPHA_FLAG, BETA_FLAG = range(3)
+
 debug_pos = 'r3k1r1/p1ppNp2/1n3b2/3p4/1p2P3/2N5/PPPB1P1P/R4BK1 b q - 0 1'
 debug_pos2 = 'r3k1r1/p1ppNp2/1n3b2/3p4/1p2P3/2N5/PPPB1P1P/R4B1K w q - 0 1'
 if __name__ == '__main__':
+    init_zobrist_keys()
     uci_loop()
+
 
 ''' bugs:
     - Searches more nodes than needed: mvvlva, count moves wrongly,
